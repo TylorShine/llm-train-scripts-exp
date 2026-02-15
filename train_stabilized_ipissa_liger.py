@@ -491,7 +491,7 @@ def process_single_dataset(name, config_name, tokenizer, max_length=512):
             ext = "json" if "json" in name else "csv"
             ds = load_dataset(ext, data_files=name, split="train")
         else:
-            if config_name:
+            if config_name or config_name is not "None":
                 ds = load_dataset(name, config_name, split="train")
             else:
                 ds = load_dataset(name, split="train")
@@ -525,12 +525,19 @@ def process_single_dataset(name, config_name, tokenizer, max_length=512):
 def load_and_process_datasets(dataset_names, dataset_config, tokenizer, max_length=512):
     all_processed_datasets = []
     name_list = dataset_names.split(",")
-    for name in name_list:
+    if dataset_config is not None:
+        dataset_config = dataset_config.split(",")
+    elif len(name_list) > 1:
+        dataset_config = [None] * len(name_list)
+    for name, config in zip(name_list, dataset_config):
         name = name.strip()
-        if not name: continue
-        processed = process_single_dataset(name, dataset_config, tokenizer, max_length)
-        if processed is not None: all_processed_datasets.append(processed)
-    if not all_processed_datasets: raise ValueError("No valid datasets loaded.")
+        if not name:
+            continue
+        processed = process_single_dataset(name, config, tokenizer, max_length)
+        if processed is not None:
+            all_processed_datasets.append(processed)
+    if not all_processed_datasets:
+        raise ValueError("No valid datasets loaded.")
     return concatenate_datasets(all_processed_datasets)
 
 # --- 4. メインスクリプト ---
@@ -560,6 +567,7 @@ def train():
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
     parser.add_argument("--max_length", type=int, default=512)
     parser.add_argument("--learning_rate", type=float, default=5e-5)
+    parser.add_argument("--dataset_seed", type=int, default=3303)
     
     # Stabilization Loss Params
     parser.add_argument("--lambda_lpf", type=float, default=0.05)
@@ -666,6 +674,9 @@ def train():
 
     # データセットロード
     train_dataset = load_and_process_datasets(args.dataset_names, args.dataset_config, tokenizer, args.max_length)
+    # Shuffle
+    train_dataset = train_dataset.shuffle(seed=args.dataset_seed)
+    
     
     # Logging
     reporters = []
