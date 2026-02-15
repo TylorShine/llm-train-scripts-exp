@@ -22,6 +22,8 @@ dependencies = [
     "wandb",
     "tqdm",
     "pandas",
+    "tiktoken",
+    "sentencepiece",
 ]
 
 [build-system]
