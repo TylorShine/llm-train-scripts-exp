@@ -17,6 +17,7 @@ import argparse
 import os
 import types
 import gc
+from typing import Any
 
 # --- 1. Inverse PiSSA (Tail-Tuning) 実装 ---
 
@@ -35,12 +36,6 @@ class InversePiSSALayer(nn.Module):
         
         self.initialized = False
         
-        # # 元の重み情報を取得
-        # # LigerKernel等の特殊なLinear層の場合も .weight があれば動作する想定
-        # W = original_linear.weight.data.float() # SVD精度確保のためfloat32
-        # device = W.device
-        # dtype = original_linear.weight.dtype # 元の精度 (bf16/fp16)
-        
         # 元の重みを一時的にバッファとして保持
         # この重みは perform_svd_and_initialize() で使用された後に削除
         self.register_buffer('original_weight', original_linear.weight.data.clone())
@@ -50,60 +45,10 @@ class InversePiSSALayer(nn.Module):
         self.lora_B = nn.Parameter(torch.empty(self.rank, self.in_features, dtype=self.dtype))
         self.register_buffer('weight_base', torch.empty(self.out_features, self.in_features, dtype=self.dtype))
         
-        # # 1. SVD実行 (メモリ不足時はCPUフォールバック)
-        # # force_cpu_svd=Trueの場合は強制CPUフォールバック
-        # if force_cpu_svd:
-        #     W_cpu = W.cpu()
-        #     U, S, Vh = torch.linalg.svd(W_cpu, full_matrices=False)
-        #     U, S, Vh = U.to(device), S.to(device), Vh.to(device)
-        # else:
-        #     try:
-        #         U, S, Vh = torch.linalg.svd(W, full_matrices=False)
-        #     except (torch.OutOfMemoryError):
-        #         print("  > Warning: GPU OOM for SVD, falling back to CPU.")
-        #         W_cpu = W.cpu()
-        #         U, S, Vh = torch.linalg.svd(W_cpu, full_matrices=False)
-        #         U, S, Vh = U.to(device), S.to(device), Vh.to(device)
-        #     except RuntimeError:
-        #         # サイレントにCPUフォールバック
-        #         W_cpu = W.cpu()
-        #         U, S, Vh = torch.linalg.svd(W_cpu, full_matrices=False)
-        #         U, S, Vh = U.to(device), S.to(device), Vh.to(device)
-
-        # # 2. 成分分離
-        # # Inverse PiSSA: 下位 rank 個を学習対象(LoRA)にする
-        # # Keep indices: 0 ~ (Total - rank)
-        # keep_indices = slice(0, -rank)
-        # train_indices = slice(-rank, None)
-
-        # # Base (Frozen High-Energy components)
-        # W_base = U[:, keep_indices] @ torch.diag(S[keep_indices]) @ Vh[keep_indices, :]
-        
-        # # Adapter Init (Trainable Low-Energy components)
-        # U_tail = U[:, train_indices]
-        # S_tail = S[train_indices]
-        # Vh_tail = Vh[train_indices, :]
-        
-        # S_sqrt = torch.diag(torch.sqrt(S_tail))
-        # A_init = U_tail @ S_sqrt
-        # B_init = S_sqrt @ Vh_tail
-
-        # # 3. パラメータ登録
-        # # Baseは勾配計算しないバッファとして登録
-        # self.register_buffer('weight_base', W_base.to(dtype=dtype))
-        
-        # # 学習対象のアダプタ (A: out x r, B: r x in)
-        # self.lora_A = nn.Parameter(A_init.to(dtype=dtype))
-        # self.lora_B = nn.Parameter(B_init.to(dtype=dtype))
-        
         if original_linear.bias is not None:
             self.bias = nn.Parameter(original_linear.bias.data.clone())
         else:
             self.register_parameter('bias', None)
-
-        # # メモリ掃除
-        # del W, U, S, Vh, W_base, A_init, B_init
-        # torch.cuda.empty_cache()
         
     def perform_svd_and_initialize(self, svd_device='cpu'):
         """
@@ -266,8 +211,8 @@ class StabilizedLigerWrapper(nn.Module):
         self.num_layers = len(self.layers)
         
         for i in range(self.num_layers):
-            self.scales[f"layer_{i}_attn"] = nn.Parameter(torch.ones(1) * init_scale)
-            self.scales[f"layer_{i}_mlp"] = nn.Parameter(torch.ones(1) * init_scale)
+            self.scales[f"layer_{i}_attn"] = nn.Parameter(torch.ones(1, device=self.device, dtype=self.dtype) * init_scale)
+            self.scales[f"layer_{i}_mlp"] = nn.Parameter(torch.ones(1, device=self.device, dtype=self.dtype) * init_scale)
 
         self._apply_forward_patch()
     
@@ -554,6 +499,7 @@ def train():
     parser.add_argument("--use_lora", action="store_true")
     parser.add_argument("--use_inverse_pissa", action="store_true", help="Enable Inverse PiSSA (Tail-Tuning)")
     
+    parser.add_argument("--use_ddp",  action="store_true", help="Enable Distributed Data Parallel (DDP)")
     parser.add_argument("--svd_device", type=str, default="cpu", help="SVD device")
     
     # Tuning Hyperparams
@@ -584,6 +530,12 @@ def train():
     
     args = parser.parse_args()
     
+    
+    if args.use_ddp:
+        from accelerate import Accelerator
+        from accelerate.utils import broadcast_object_list
+        accelerator = Accelerator()
+    
     # トークナイザー
     print(f"Loading model: {args.model_id}")
     tokenizer = AutoTokenizer.from_pretrained(args.model_id)
@@ -595,32 +547,63 @@ def train():
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     device = f"cuda:{local_rank}"
     
-    model = AutoLigerKernelForCausalLM.from_pretrained(
-        args.model_id,
-        torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
-        attn_implementation="flash_attention_2",
-        trust_remote_code=True,
-        # device_map = "auto"
-    )
-    model.gradient_checkpointing_enable()
+    # 一旦モデルロード
+    with accelerator.main_process_first():
+        model = AutoLigerKernelForCausalLM.from_pretrained(
+            args.model_id,
+            torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
+            attn_implementation="flash_attention_2",
+            trust_remote_code=True,
+            # device_map = "auto"
+        )
 
-    # --- 構造変更の適用順序 ---
+    # --- 構造変更の適用 ---
     
     # 1. Inverse PiSSA (Tail-Tuning) の適用
     #    LoRAよりも先に構造を変える必要がある
+    target_modules = args.pissa_target_modules.split(",")
+    model = apply_inverse_pissa(model, target_modules=target_modules, rank=args.pissa_rank)
+    print(f"[Mode: Inverse PiSSA] Tunable rank: {args.pissa_rank}, Modules: {target_modules}")
+    
     if args.use_inverse_pissa:
-        target_modules = args.pissa_target_modules.split(",")
-        model = apply_inverse_pissa(model, target_modules=target_modules, rank=args.pissa_rank)
-        print(f"[Mode: Inverse PiSSA] Tunable rank: {args.pissa_rank}, Modules: {target_modules}")
+        object_to_broadcast = None
+        if int(local_rank) == 0:
+            # rank0のみが変換実行
+            
+            # モデル全体をSVD計算用のデバイスに一旦移動
+            model.to(device=args.svd_device)
+            # 指定したデバイス上でSVDを実行し、パラメータを初期化
+            print(f"Initializing InversePiSSALayer parameters on {args.svd_device}...")
+            model.apply(lambda module:
+                module.perform_svd_and_initialize(svd_device=args.svd_device)
+                if isinstance(module, InversePiSSALayer) else None
+            )
+            
+            if args.use_ddp:
+                # state_dictをCPUで取得
+                state_dict = model.cpu().state_dict()
+                
+                # ブロードキャストするオブジェクトを準備
+                object_to_broadcast = [state_dict]
+        elif args.use_ddp:
+            # rank0以外は受信用のプレースホルダを作成
+            object_to_broadcast = [None]
+            
+        object_to_broadcast: list[Any]
         
-        # モデル全体をSVD計算用のデバイスに一旦移動
-        model.to(device=args.svd_device)
-        # 指定したデバイス上でSVDを実行し、パラメータを初期化
-        print(f"Initializing InversePiSSALayer parameters on {args.svd_device}...")
-        model.apply(lambda module:
-            module.perform_svd_and_initialize(svd_device=args.svd_device)
-            if isinstance(module, InversePiSSALayer) else None
-        )
+        if args.use_ddp:
+            # ブロードキャスト実行
+            broadcast_object_list(object_to_broadcast, from_process=0)
+            
+            # 受信したモデルをロード
+            print(f"--- Process {accelerator.process_index}: Loading broadcasted state_dict ---")
+            model.load_state_dict(object_to_broadcast[0])
+            
+            # メモリを解放
+            del object_to_broadcast
+            
+            # 一応ブロック
+            accelerator.wait_for_everyone()
 
     # 2. LoRA (PEFT) の適用
     #    Inverse PiSSAと併用する場合、PiSSA層以外の層(q_projなど)にLoRAをかけることも可能だが、
@@ -676,7 +659,6 @@ def train():
     train_dataset = load_and_process_datasets(args.dataset_names, args.dataset_config, tokenizer, args.max_length)
     # Shuffle
     train_dataset = train_dataset.shuffle(seed=args.dataset_seed)
-    
     
     # Logging
     reporters = []
