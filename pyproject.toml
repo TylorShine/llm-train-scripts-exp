@@ -1,0 +1,35 @@
+[project]
+name = "llm-train-scripts-exp"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.9"
+
+dependencies = [
+    # --- Core ML/DL Frameworks ---
+    "torch>=2.1",
+    # --- Hugging Face Ecosystem ---
+    "transformers>=4.38",
+    "datasets>=2.18",
+    "peft>=0.9",
+    "accelerate>=0.27",
+    # --- Custom/High-Performance Components ---
+    "schedulefree",
+    "flash-attn>=2.5.0",
+    "liger-kernel",
+    # --- Utilities & Logging ---
+    "tensorboard",
+    "wandb",
+    "tqdm",
+    "pandas",
+]
+
+[build-system]
+requires = ["setuptools>=42"]
+build-backend = "setuptools.build_meta"
+
+[tool.uv]
+no-build-isolation-package = ["flash-attn"]
+
+[tool.uv.extra-build-variables]
+"flash_attn" = { TORCH_CUDA_ARCH_LIST = "9.0", FLASH_ATTN_CUDA_ARCHS = "90", MAX_JOBS = "64" }
