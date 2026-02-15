@@ -25,49 +25,119 @@ class InversePiSSALayer(nn.Module):
     Inverse PiSSA: 主要成分(Top Singular Values)を固定し、
     微小成分(Tail Singular Values)のみを学習する層。
     """
-    def __init__(self, original_linear, rank=128, alpha=1.0, force_cpu_svd=False):
+    def __init__(self, original_linear, rank=128, alpha=1.0):
         super().__init__()
         self.rank = rank
         self.alpha = alpha
+        self.in_features = original_linear.in_features
+        self.out_features = original_linear.out_features
+        self.dtype = original_linear.weight.dtype
         
-        # 元の重み情報を取得
-        # LigerKernel等の特殊なLinear層の場合も .weight があれば動作する想定
-        W = original_linear.weight.data.float() # SVD精度確保のためfloat32
-        device = W.device
-        dtype = original_linear.weight.dtype # 元の精度 (bf16/fp16)
+        self.initialized = False
+        
+        # # 元の重み情報を取得
+        # # LigerKernel等の特殊なLinear層の場合も .weight があれば動作する想定
+        # W = original_linear.weight.data.float() # SVD精度確保のためfloat32
+        # device = W.device
+        # dtype = original_linear.weight.dtype # 元の精度 (bf16/fp16)
+        
+        # 元の重みを一時的にバッファとして保持
+        # この重みは perform_svd_and_initialize() で使用された後に削除
+        self.register_buffer('original_weight', original_linear.weight.data.clone())
+        
+         # 学習対象のパラメータと凍結部分のバッファを未初期化状態で確保
+        self.lora_A = nn.Parameter(torch.empty(self.out_features, self.rank, dtype=self.dtype))
+        self.lora_B = nn.Parameter(torch.empty(self.rank, self.in_features, dtype=self.dtype))
+        self.register_buffer('weight_base', torch.empty(self.out_features, self.in_features, dtype=self.dtype))
+        
+        # # 1. SVD実行 (メモリ不足時はCPUフォールバック)
+        # # force_cpu_svd=Trueの場合は強制CPUフォールバック
+        # if force_cpu_svd:
+        #     W_cpu = W.cpu()
+        #     U, S, Vh = torch.linalg.svd(W_cpu, full_matrices=False)
+        #     U, S, Vh = U.to(device), S.to(device), Vh.to(device)
+        # else:
+        #     try:
+        #         U, S, Vh = torch.linalg.svd(W, full_matrices=False)
+        #     except (torch.OutOfMemoryError):
+        #         print("  > Warning: GPU OOM for SVD, falling back to CPU.")
+        #         W_cpu = W.cpu()
+        #         U, S, Vh = torch.linalg.svd(W_cpu, full_matrices=False)
+        #         U, S, Vh = U.to(device), S.to(device), Vh.to(device)
+        #     except RuntimeError:
+        #         # サイレントにCPUフォールバック
+        #         W_cpu = W.cpu()
+        #         U, S, Vh = torch.linalg.svd(W_cpu, full_matrices=False)
+        #         U, S, Vh = U.to(device), S.to(device), Vh.to(device)
 
-        print(f"  > SVD computing for shape {W.shape} on {device}...")
+        # # 2. 成分分離
+        # # Inverse PiSSA: 下位 rank 個を学習対象(LoRA)にする
+        # # Keep indices: 0 ~ (Total - rank)
+        # keep_indices = slice(0, -rank)
+        # train_indices = slice(-rank, None)
+
+        # # Base (Frozen High-Energy components)
+        # W_base = U[:, keep_indices] @ torch.diag(S[keep_indices]) @ Vh[keep_indices, :]
         
-        # 1. SVD実行 (メモリ不足時はCPUフォールバック)
-        # force_cpu_svd=Trueの場合は強制CPUフォールバック
-        if force_cpu_svd:
-            W_cpu = W.cpu()
-            U, S, Vh = torch.linalg.svd(W_cpu, full_matrices=False)
-            U, S, Vh = U.to(device), S.to(device), Vh.to(device)
+        # # Adapter Init (Trainable Low-Energy components)
+        # U_tail = U[:, train_indices]
+        # S_tail = S[train_indices]
+        # Vh_tail = Vh[train_indices, :]
+        
+        # S_sqrt = torch.diag(torch.sqrt(S_tail))
+        # A_init = U_tail @ S_sqrt
+        # B_init = S_sqrt @ Vh_tail
+
+        # # 3. パラメータ登録
+        # # Baseは勾配計算しないバッファとして登録
+        # self.register_buffer('weight_base', W_base.to(dtype=dtype))
+        
+        # # 学習対象のアダプタ (A: out x r, B: r x in)
+        # self.lora_A = nn.Parameter(A_init.to(dtype=dtype))
+        # self.lora_B = nn.Parameter(B_init.to(dtype=dtype))
+        
+        if original_linear.bias is not None:
+            self.bias = nn.Parameter(original_linear.bias.data.clone())
         else:
-            try:
-                U, S, Vh = torch.linalg.svd(W, full_matrices=False)
-            except (torch.OutOfMemoryError):
-                print("  > Warning: GPU OOM for SVD, falling back to CPU.")
-                W_cpu = W.cpu()
-                U, S, Vh = torch.linalg.svd(W_cpu, full_matrices=False)
-                U, S, Vh = U.to(device), S.to(device), Vh.to(device)
-            except RuntimeError:
-                # サイレントにCPUフォールバック
-                W_cpu = W.cpu()
-                U, S, Vh = torch.linalg.svd(W_cpu, full_matrices=False)
-                U, S, Vh = U.to(device), S.to(device), Vh.to(device)
+            self.register_parameter('bias', None)
 
-        # 2. 成分分離
-        # Inverse PiSSA: 下位 rank 個を学習対象(LoRA)にする
-        # Keep indices: 0 ~ (Total - rank)
-        keep_indices = slice(0, -rank)
-        train_indices = slice(-rank, None)
+        # # メモリ掃除
+        # del W, U, S, Vh, W_base, A_init, B_init
+        # torch.cuda.empty_cache()
+        
+    def perform_svd_and_initialize(self, svd_device='cpu'):
+        """
+        保持している元の重みデータを使用してSVDを実行し、パラメータを初期化。
+        マルチGPU環境では、モデルを各GPUに転送する前に、
+        CPU上のモデルに対してこのメソッドを呼び出すことを想定。
+        
+        Args:
+            svd_device (str or torch.device): SVD計算を実行するデバイス。
+        """
+        if self.initialized:
+            print("  > Warning: Already initialized. Skipping SVD.")
+            return
 
-        # Base (Frozen High-Energy components)
+        if not hasattr(self, 'original_weight') or self.original_weight is None:
+            raise RuntimeError("Original weight not found. It may have been already used and deleted.")
+
+        # このモジュールが最終的に配置されるデバイス
+        target_device = self.lora_A.device
+        
+        # SVD計算のために、元の重みを指定されたデバイスのfloat32に転送
+        W = self.original_weight.to(device=svd_device, dtype=torch.float32)
+        
+        print(f"  > SVD computing for shape {W.shape} on {svd_device}...")
+        
+        # 指定されたデバイスでSVDを実行
+        U, S, Vh = torch.linalg.svd(W, full_matrices=False)
+
+        # 2. 成分分離 (計算は引き続き svd_device で行われる)
+        keep_indices = slice(0, -self.rank)
+        train_indices = slice(-self.rank, None)
+
         W_base = U[:, keep_indices] @ torch.diag(S[keep_indices]) @ Vh[keep_indices, :]
         
-        # Adapter Init (Trainable Low-Energy components)
         U_tail = U[:, train_indices]
         S_tail = S[train_indices]
         Vh_tail = Vh[train_indices, :]
@@ -77,23 +147,31 @@ class InversePiSSALayer(nn.Module):
         B_init = S_sqrt @ Vh_tail
 
         # 3. パラメータ登録
-        # Baseは勾配計算しないバッファとして登録
-        self.register_buffer('weight_base', W_base.to(dtype=dtype))
+        # 計算結果をこのモジュールの本来のデバイス(target_device)と型に戻してコピー
+        with torch.no_grad():
+            self.weight_base.copy_(W_base.to(device=target_device, dtype=self.dtype))
+            self.lora_A.copy_(A_init.to(device=target_device, dtype=self.dtype))
+            self.lora_B.copy_(B_init.to(device=target_device, dtype=self.dtype))
         
-        # 学習対象のアダプタ (A: out x r, B: r x in)
-        self.lora_A = nn.Parameter(A_init.to(dtype=dtype))
-        self.lora_B = nn.Parameter(B_init.to(dtype=dtype))
+        self.initialized = True
         
-        if original_linear.bias is not None:
-            self.bias = nn.Parameter(original_linear.bias.data)
-        else:
-            self.register_parameter('bias', None)
-
-        # メモリ掃除
+        # メモリを解放するために一時的な重みを削除
+        del self.original_weight
+        self.register_buffer('original_weight', None)
+        
+        # SVD計算デバイス上のテンソルを解放
         del W, U, S, Vh, W_base, A_init, B_init
-        torch.cuda.empty_cache()
+        if torch.device(svd_device).type == 'cuda':
+            torch.cuda.synchronize(svd_device)
+            torch.cuda.empty_cache()
 
     def forward(self, x):
+        if not self.initialized:
+            raise RuntimeError(
+                "InversePiSSALayer is not initialized. "
+                "Call perform_svd_and_initialize() on the CPU model before moving to the GPU."
+            )
+            
         # Base (Frozen) path
         base_out = nn.functional.linear(x, self.weight_base, self.bias)
         # Adapter (Trainable Tail) path: x @ B.T @ A.T
@@ -103,20 +181,25 @@ class InversePiSSALayer(nn.Module):
 
     def merge_to_linear(self):
         """標準的なnn.Linearに戻す"""
+        if not self.initialized:
+            raise RuntimeError("InversePiSSALayer is not initialized.")
+            
         with torch.no_grad():
             W_new = self.weight_base + (self.lora_A @ self.lora_B)
             
             new_linear = nn.Linear(
-                in_features=W_new.shape[1],
-                out_features=W_new.shape[0],
-                bias=(self.bias is not None)
+                in_features=self.in_features,
+                out_features=self.out_features,
+                bias=(self.bias is not None),
+                device=W_new.device, # 現在のデバイスに作成
+                dtype=W_new.dtype   # 現在のデータ型に合わせる
             )
-            new_linear.weight.data = W_new
+            new_linear.weight.data.copy_(W_new)
             if self.bias is not None:
-                new_linear.bias.data = self.bias
+                new_linear.bias.data.copy_(self.bias)
             return new_linear
 
-def apply_inverse_pissa(model, target_modules=["o_proj", "down_proj"], rank=128, force_cpu_svd=False):
+def apply_inverse_pissa(model, target_modules=["o_proj", "down_proj"], rank=128):
     """モデル内の指定層をInversePiSSALayerに置換"""
     print(f"Converting target modules {target_modules} to Inverse PiSSA (Rank {rank})...")
     
@@ -143,8 +226,8 @@ def apply_inverse_pissa(model, target_modules=["o_proj", "down_proj"], rank=128,
         module = getattr(parent, child_name)
         print(f" - Processing: {name}")
         
-        # 新しい層を作成 (ここでSVDが走る)
-        pissa_layer = InversePiSSALayer(module, rank=rank, force_cpu_svd=force_cpu_svd)
+        # 新しい層を作成
+        pissa_layer = InversePiSSALayer(module, rank=rank)
         
         # 置換
         setattr(parent, child_name, pissa_layer)
@@ -463,7 +546,8 @@ def train():
     parser.add_argument("--only_train_layerscale", action="store_true")
     parser.add_argument("--use_lora", action="store_true")
     parser.add_argument("--use_inverse_pissa", action="store_true", help="Enable Inverse PiSSA (Tail-Tuning)")
-    parser.add_argument("--force_cpu_svd", action="store_true", help="Force CPU SVD fallback")
+    
+    parser.add_argument("--svd_device", type=str, default="cpu", help="SVD device")
     
     # Tuning Hyperparams
     parser.add_argument("--lora_r", type=int, default=16)
@@ -509,7 +593,7 @@ def train():
         attn_implementation="flash_attention_2",
         trust_remote_code=True,
         # device_map = "auto"
-    ).to(device)
+    )
     model.gradient_checkpointing_enable()
 
     # --- 構造変更の適用順序 ---
@@ -518,8 +602,17 @@ def train():
     #    LoRAよりも先に構造を変える必要がある
     if args.use_inverse_pissa:
         target_modules = args.pissa_target_modules.split(",")
-        model = apply_inverse_pissa(model, target_modules=target_modules, rank=args.pissa_rank, force_cpu_svd=args.force_cpu_svd)
+        model = apply_inverse_pissa(model, target_modules=target_modules, rank=args.pissa_rank)
         print(f"[Mode: Inverse PiSSA] Tunable rank: {args.pissa_rank}, Modules: {target_modules}")
+        
+        # モデル全体をSVD計算用のデバイスに一旦移動
+        model.to(device=args.svd_device)
+        # 指定したデバイス上でSVDを実行し、パラメータを初期化
+        print(f"Initializing InversePiSSALayer parameters on {args.svd_device}...")
+        model.apply(lambda module:
+            module.perform_svd_and_initialize(svd_device=args.svd_device)
+            if isinstance(module, InversePiSSALayer) else None
+        )
 
     # 2. LoRA (PEFT) の適用
     #    Inverse PiSSAと併用する場合、PiSSA層以外の層(q_projなど)にLoRAをかけることも可能だが、
