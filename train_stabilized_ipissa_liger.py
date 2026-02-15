@@ -1,25 +1,3 @@
-# /// script
-# requires-python = ">=3.9"
-# dependencies = [
-#   # --- Core ML/DL Frameworks ---
-#   "torch>=2.1",
-#   # --- Hugging Face Ecosystem ---
-#   "transformers>=4.38",
-#   "datasets>=2.18",
-#   "peft>=0.9",
-#   "accelerate>=0.27",
-#   # --- Custom/High-Performance Components ---
-#   "schedulefree",
-#   # "flash-attn>=2.5.0",  # need to be install manually with --no-build-isolation
-#   "liger-kernel",
-#   # --- Utilities & Logging ---
-#   "tensorboard",
-#   "wandb",
-#   "tqdm",
-#   "pandas",
-# ]
-# ///
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
