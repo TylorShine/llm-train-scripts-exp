@@ -25,7 +25,7 @@ class InversePiSSALayer(nn.Module):
     Inverse PiSSA: 主要成分(Top Singular Values)を固定し、
     微小成分(Tail Singular Values)のみを学習する層。
     """
-    def __init__(self, original_linear, rank=128, alpha=1.0):
+    def __init__(self, original_linear, rank=128, alpha=1.0, force_cpu_svd=False):
         super().__init__()
         self.rank = rank
         self.alpha = alpha
@@ -39,13 +39,24 @@ class InversePiSSALayer(nn.Module):
         print(f"  > SVD computing for shape {W.shape} on {device}...")
         
         # 1. SVD実行 (メモリ不足時はCPUフォールバック)
-        try:
-            U, S, Vh = torch.linalg.svd(W, full_matrices=False)
-        except torch.OutOfMemoryError:
-            print("  > Warning: GPU OOM for SVD, falling back to CPU.")
+        # force_cpu_svd=Trueの場合は強制CPUフォールバック
+        if force_cpu_svd:
             W_cpu = W.cpu()
             U, S, Vh = torch.linalg.svd(W_cpu, full_matrices=False)
             U, S, Vh = U.to(device), S.to(device), Vh.to(device)
+        else:
+            try:
+                U, S, Vh = torch.linalg.svd(W, full_matrices=False)
+            except (torch.OutOfMemoryError):
+                print("  > Warning: GPU OOM for SVD, falling back to CPU.")
+                W_cpu = W.cpu()
+                U, S, Vh = torch.linalg.svd(W_cpu, full_matrices=False)
+                U, S, Vh = U.to(device), S.to(device), Vh.to(device)
+            except RuntimeError:
+                # サイレントにCPUフォールバック
+                W_cpu = W.cpu()
+                U, S, Vh = torch.linalg.svd(W_cpu, full_matrices=False)
+                U, S, Vh = U.to(device), S.to(device), Vh.to(device)
 
         # 2. 成分分離
         # Inverse PiSSA: 下位 rank 個を学習対象(LoRA)にする
@@ -105,7 +116,7 @@ class InversePiSSALayer(nn.Module):
                 new_linear.bias.data = self.bias
             return new_linear
 
-def apply_inverse_pissa(model, target_modules=["o_proj", "down_proj"], rank=128):
+def apply_inverse_pissa(model, target_modules=["o_proj", "down_proj"], rank=128, force_cpu_svd=False):
     """モデル内の指定層をInversePiSSALayerに置換"""
     print(f"Converting target modules {target_modules} to Inverse PiSSA (Rank {rank})...")
     
@@ -133,7 +144,7 @@ def apply_inverse_pissa(model, target_modules=["o_proj", "down_proj"], rank=128)
         print(f" - Processing: {name}")
         
         # 新しい層を作成 (ここでSVDが走る)
-        pissa_layer = InversePiSSALayer(module, rank=rank)
+        pissa_layer = InversePiSSALayer(module, rank=rank, force_cpu_svd=force_cpu_svd)
         
         # 置換
         setattr(parent, child_name, pissa_layer)
@@ -452,6 +463,7 @@ def train():
     parser.add_argument("--only_train_layerscale", action="store_true")
     parser.add_argument("--use_lora", action="store_true")
     parser.add_argument("--use_inverse_pissa", action="store_true", help="Enable Inverse PiSSA (Tail-Tuning)")
+    parser.add_argument("--force_cpu_svd", action="store_true", help="Force CPU SVD fallback")
     
     # Tuning Hyperparams
     parser.add_argument("--lora_r", type=int, default=16)
@@ -506,7 +518,7 @@ def train():
     #    LoRAよりも先に構造を変える必要がある
     if args.use_inverse_pissa:
         target_modules = args.pissa_target_modules.split(",")
-        model = apply_inverse_pissa(model, target_modules=target_modules, rank=args.pissa_rank)
+        model = apply_inverse_pissa(model, target_modules=target_modules, rank=args.pissa_rank, force_cpu_svd=args.force_cpu_svd)
         print(f"[Mode: Inverse PiSSA] Tunable rank: {args.pissa_rank}, Modules: {target_modules}")
 
     # 2. LoRA (PEFT) の適用
