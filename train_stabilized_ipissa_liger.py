@@ -42,8 +42,12 @@ class InversePiSSALayer(nn.Module):
         self.register_buffer('original_weight', original_linear.weight.data.clone(), persistent=False)
         
          # 学習対象のパラメータと凍結部分のバッファを未初期化状態で確保
-        self.lora_A = nn.Parameter(torch.empty(self.out_features, self.rank, dtype=self.dtype))
-        self.lora_B = nn.Parameter(torch.empty(self.rank, self.in_features, dtype=self.dtype))
+        # self.lora_A = nn.Parameter(torch.empty(self.out_features, self.rank, dtype=self.dtype))
+        # self.lora_B = nn.Parameter(torch.empty(self.rank, self.in_features, dtype=self.dtype))
+        self.lora_A_delta = nn.Parameter(torch.empty(self.out_features, self.rank, dtype=self.dtype))
+        self.lora_B_delta = nn.Parameter(torch.empty(self.rank, self.in_features, dtype=self.dtype))
+        self.register_buffer('lora_A_fixed', torch.empty(self.out_features, self.rank, dtype=self.dtype))
+        self.register_buffer('lora_B_fixed', torch.empty(self.rank, self.in_features, dtype=self.dtype))
         self.register_buffer('weight_base', torch.empty(self.out_features, self.in_features, dtype=self.dtype))
         
         if original_linear.bias is not None:
@@ -68,7 +72,7 @@ class InversePiSSALayer(nn.Module):
             raise RuntimeError("Original weight not found. It may have been already used and deleted.")
 
         # このモジュールが最終的に配置されるデバイス
-        target_device = self.lora_A.device
+        target_device = self.lora_A_delta.device
         
         # SVD計算のために、元の重みを指定されたデバイスのfloat32に転送
         W = self.original_weight.to(device=svd_device, dtype=torch.float32)
@@ -96,8 +100,14 @@ class InversePiSSALayer(nn.Module):
         # 計算結果をこのモジュールの本来のデバイス(target_device)と型に戻してコピー
         with torch.no_grad():
             self.weight_base.copy_(W_base.to(device=target_device, dtype=self.dtype))
-            self.lora_A.copy_(A_init.to(device=target_device, dtype=self.dtype))
-            self.lora_B.copy_(B_init.to(device=target_device, dtype=self.dtype))
+            # self.lora_A.copy_(A_init.to(device=target_device, dtype=self.dtype))
+            # self.lora_B.copy_(B_init.to(device=target_device, dtype=self.dtype))
+            self.lora_A_fixed.copy_(A_init.to(device=target_device, dtype=self.dtype))
+            self.lora_B_fixed.copy_(B_init.to(device=target_device, dtype=self.dtype))
+            
+            # 学習用deltaは0初期化
+            self.lora_A_delta.zero_()
+            self.lora_B_delta.zero_()
         
         self.initialized = True
         
@@ -119,8 +129,16 @@ class InversePiSSALayer(nn.Module):
             
         # Base (Frozen) path
         base_out = nn.functional.linear(x, self.weight_base, self.bias)
-        # Adapter (Trainable Tail) path: x @ B.T @ A.T
-        adapter_out = (x @ self.lora_B.T) @ self.lora_A.T
+        # # Adapter (Trainable Tail) path: x @ B.T @ A.T
+        # adapter_out = (x @ self.lora_B.T) @ self.lora_A.T
+        
+        # Adapter (Fixed SVD + Learnable Delta)
+        # (A_fixed + A_delta) @ (B_fixed + B_delta)
+        # 初期状態では Delta=0 なので A_fixed @ B_fixed (元のTail) となる
+        A_eff = self.lora_A_fixed + self.lora_A_delta
+        B_eff = self.lora_B_fixed + self.lora_B_delta
+        
+        adapter_out = (x @ B_eff.T) @ A_eff.T
         
         return base_out + (self.alpha * adapter_out)
 
@@ -130,7 +148,11 @@ class InversePiSSALayer(nn.Module):
             raise RuntimeError("InversePiSSALayer is not initialized.")
             
         with torch.no_grad():
-            W_new = self.weight_base + (self.lora_A @ self.lora_B)
+            # W_new = self.weight_base + (self.lora_A @ self.lora_B)
+            
+            A_eff = self.lora_A_fixed + self.lora_A_delta
+            B_eff = self.lora_B_fixed + self.lora_B_delta
+            W_new = self.weight_base + (A_eff @ B_eff)
             
             new_linear = nn.Linear(
                 in_features=self.in_features,
@@ -507,6 +529,8 @@ def train():
     parser.add_argument("--use_ddp",  action="store_true", help="Enable Distributed Data Parallel (DDP)")
     parser.add_argument("--svd_device", type=str, default="cpu", help="SVD device")
     
+    parser.add_argument("--optim_setup", type=str, default="schedule_free_radam", help="optimizer setup")
+    
     # Tuning Hyperparams
     parser.add_argument("--lora_r", type=int, default=16)
     parser.add_argument("--pissa_rank", type=int, default=128, help="Rank for Inverse PiSSA (Trainable tail components)")
@@ -691,6 +715,17 @@ def train():
             os.environ["WANDB_PROJECT"] = args.wandb_project
         if args.wandb_run_name:
             os.environ["WANDB_RUN_NAME"] = args.wandb_run_name
+            
+    optim_setup = {}
+    if args.optim_setup == "schedule_free_radam":
+        optim_setup["lr_scheduler_type"] = "constant"
+        optim_setup["optim"] = "schedule_free_radam"
+    elif args.optim_setup == "adamw_torch_fused":
+        optim_setup["lr_scheduler_type"] = "cosine"
+        optim_setup["optim"] = "adamw_torch_fused"
+        optim_setup["warmup_steps"] = 100
+    else:
+        raise ValueError(f"Unknown optimizer setup: {args.optim_setup}")
 
     training_args = TrainingArguments(
         output_dir=args.output_dir,
@@ -702,12 +737,16 @@ def train():
         fp16=not torch.cuda.is_bf16_supported(),
         bf16=torch.cuda.is_bf16_supported(),
         save_strategy="steps",
-        save_steps=50,
+        save_steps=100,
         save_total_limit=2,
         report_to=reporters,
         remove_unused_columns=False,
-        lr_scheduler_type="constant",   # schedule_free_radamなら問題ない
-        optim="schedule_free_radam"
+        # lr_scheduler_type="constant",   # schedule_free_radamなら問題ない
+        # optim="schedule_free_radam"
+        # optim="adamw_torch_fused",
+        # lr_scheduler_type="cosine",
+        # warmup_steps=100,
+        **optim_setup
     )
 
     trainer = Trainer(
