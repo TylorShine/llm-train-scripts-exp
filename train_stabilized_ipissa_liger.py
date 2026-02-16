@@ -11,7 +11,7 @@ from transformers import (
 from peft import LoraConfig, TaskType, get_peft_model
 from peft.tuners.lora import Linear as LoraLinear
 from liger_kernel.transformers import AutoLigerKernelForCausalLM
-from datasets import load_dataset, concatenate_datasets
+from datasets import load_dataset, load_dataset_builder, concatenate_datasets
 import schedulefree
 import argparse
 import os
@@ -457,7 +457,7 @@ class StabilizedLigerWrapper(nn.Module):
 
 
 # --- 3. データセット処理 ---
-def process_single_dataset(name, config_name, tokenizer, max_length=512):
+def process_single_dataset(name, config_name, tokenizer, max_length=512, local_rank=0):
     print(f"Loading: {name} (config: {config_name})")
     try:
         if name.endswith(".json") or name.endswith(".jsonl") or name.endswith(".csv"):
@@ -496,9 +496,28 @@ def process_single_dataset(name, config_name, tokenizer, max_length=512):
         return examples
     return ds.map(add_labels, batched=True)
 
-def load_and_process_datasets(dataset_names, dataset_config, tokenizer, max_length=512):
+def load_and_process_datasets(dataset_names, dataset_config, tokenizer, max_length=512, local_rank=0, procecced_callback=None):
     all_processed_datasets = []
     name_list = dataset_names.split(",")
+    if local_rank == 0:
+        if dataset_config is not None:
+            dataset_config = dataset_config.split(",")
+        elif len(name_list) > 1:
+            dataset_config = [None] * len(name_list)
+        for name, config in zip(name_list, dataset_config):
+            name = name.strip()
+            if not name:
+                continue
+            processed = process_single_dataset(name, config, tokenizer, max_length)
+            if processed is not None:
+                all_processed_datasets.append(processed)
+        if not all_processed_datasets:
+            raise ValueError("No valid datasets loaded.")
+        concatenated_dataset = concatenate_datasets(all_processed_datasets)
+    if procecced_callback is not None:
+        # 同期用
+        procecced_callback()
+    
     if dataset_config is not None:
         dataset_config = dataset_config.split(",")
     elif len(name_list) > 1:
@@ -512,7 +531,9 @@ def load_and_process_datasets(dataset_names, dataset_config, tokenizer, max_leng
             all_processed_datasets.append(processed)
     if not all_processed_datasets:
         raise ValueError("No valid datasets loaded.")
-    return concatenate_datasets(all_processed_datasets)
+    concatenated_dataset = concatenate_datasets(all_processed_datasets)
+    
+    return concatenated_dataset
 
 # --- 4. メインスクリプト ---
 
@@ -573,7 +594,10 @@ def train():
     # トークナイザー
     tokenizer_id = args.tokenizer_id if args.tokenizer_id is not None else args.model_id
     print(f"Loading tokenizer model: {tokenizer_id}")
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_id)
+    tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer_id,
+        trust_remote_code=True,
+    )
     if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
     
     # モデルロード
@@ -709,11 +733,9 @@ def train():
         print(f"Trainable params: {trainable_params:,} / {all_params:,} ({100*trainable_params/all_params:.2f}%)")
 
     # データセットロード
-    if int(local_rank) == 0:
-        # rank0のみが実行
-        train_dataset = load_and_process_datasets(args.dataset_names, args.dataset_config, tokenizer, args.max_length)
-        # Shuffle
-        train_dataset = train_dataset.shuffle(seed=args.dataset_seed)
+    train_dataset = load_and_process_datasets(args.dataset_names, args.dataset_config, tokenizer, args.max_length, local_rank, None if not args.use_ddp else accelerator.wait_for_everyone)
+    # Shuffle
+    train_dataset = train_dataset.shuffle(seed=args.dataset_seed)
     
     # Logging
     reporters = []
