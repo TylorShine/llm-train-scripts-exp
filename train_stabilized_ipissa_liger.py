@@ -37,8 +37,9 @@ class InversePiSSALayer(nn.Module):
         self.initialized = False
         
         # 元の重みを一時的にバッファとして保持
-        # この重みは perform_svd_and_initialize() で使用された後に削除
-        self.register_buffer('original_weight', original_linear.weight.data.clone())
+        # DDP broadcast/load_state_dict で「無いとエラー」にならないよう persistent=False
+        # (SVD初期化のために一時的に参照できれば十分で、チェックポイントに含めない)
+        self.register_buffer('original_weight', original_linear.weight.data.clone(), persistent=False)
         
          # 学習対象のパラメータと凍結部分のバッファを未初期化状態で確保
         self.lora_A = nn.Parameter(torch.empty(self.out_features, self.rank, dtype=self.dtype))
@@ -100,9 +101,8 @@ class InversePiSSALayer(nn.Module):
         
         self.initialized = True
         
-        # メモリを解放するために一時的な重みを削除
-        del self.original_weight
-        self.register_buffer('original_weight', None)
+        # メモリを解放するために一時的な重みを破棄
+        self.original_weight = None
         
         # SVD計算デバイス上のテンソルを解放
         del W, U, S, Vh, W_base, A_init, B_init
@@ -209,10 +209,14 @@ class StabilizedLigerWrapper(nn.Module):
             self.layers = model.model.layers
             
         self.num_layers = len(self.layers)
+
+        ref_param = next(self.model.parameters(), None)
+        ref_device = ref_param.device if ref_param is not None else torch.device("cpu")
+        ref_dtype = ref_param.dtype if ref_param is not None else torch.float32
         
         for i in range(self.num_layers):
-            self.scales[f"layer_{i}_attn"] = nn.Parameter(torch.ones(1, device=self.device, dtype=self.dtype) * init_scale)
-            self.scales[f"layer_{i}_mlp"] = nn.Parameter(torch.ones(1, device=self.device, dtype=self.dtype) * init_scale)
+            self.scales[f"layer_{i}_attn"] = nn.Parameter(torch.ones(1, device=ref_device, dtype=ref_dtype) * init_scale)
+            self.scales[f"layer_{i}_mlp"] = nn.Parameter(torch.ones(1, device=ref_device, dtype=ref_dtype) * init_scale)
 
         self._apply_forward_patch()
     
@@ -436,8 +440,9 @@ def process_single_dataset(name, config_name, tokenizer, max_length=512):
             ext = "json" if "json" in name else "csv"
             ds = load_dataset(ext, data_files=name, split="train")
         else:
-            if config_name or config_name is not "None":
-                ds = load_dataset(name, config_name, split="train")
+            cfg = None if config_name in (None, "", "None") else config_name
+            if cfg is not None:
+                ds = load_dataset(name, cfg, split="train")
             else:
                 ds = load_dataset(name, split="train")
     except Exception as e:
@@ -490,7 +495,7 @@ def load_and_process_datasets(dataset_names, dataset_config, tokenizer, max_leng
 def train():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_id", type=str, default="Qwen/Qwen2.5-0.5B-Instruct")
-    parser.add_argument("--dataset_names", type=str, required=True)
+    parser.add_argument("--dataset_names", "--dataset_name", dest="dataset_names", type=str, required=True)
     parser.add_argument("--dataset_config", type=str, default=None)
     parser.add_argument("--output_dir", type=str, default="./output_stable_pissa")
     
@@ -531,6 +536,8 @@ def train():
     args = parser.parse_args()
     
     
+    accelerator = None
+    broadcast_object_list = None
     if args.use_ddp:
         from accelerate import Accelerator
         from accelerate.utils import broadcast_object_list
@@ -548,7 +555,13 @@ def train():
     device = f"cuda:{local_rank}"
     
     # 一旦モデルロード
-    with accelerator.main_process_first():
+    if accelerator is not None:
+        main_process_ctx = accelerator.main_process_first()
+    else:
+        from contextlib import nullcontext
+        main_process_ctx = nullcontext()
+
+    with main_process_ctx:
         model = AutoLigerKernelForCausalLM.from_pretrained(
             args.model_id,
             torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
@@ -561,11 +574,11 @@ def train():
     
     # 1. Inverse PiSSA (Tail-Tuning) の適用
     #    LoRAよりも先に構造を変える必要がある
-    target_modules = args.pissa_target_modules.split(",")
-    model = apply_inverse_pissa(model, target_modules=target_modules, rank=args.pissa_rank)
-    print(f"[Mode: Inverse PiSSA] Tunable rank: {args.pissa_rank}, Modules: {target_modules}")
-    
     if args.use_inverse_pissa:
+        target_modules = args.pissa_target_modules.split(",")
+        model = apply_inverse_pissa(model, target_modules=target_modules, rank=args.pissa_rank)
+        print(f"[Mode: Inverse PiSSA] Tunable rank: {args.pissa_rank}, Modules: {target_modules}")
+
         object_to_broadcast = None
         if int(local_rank) == 0:
             # rank0のみが変換実行
@@ -597,7 +610,14 @@ def train():
             
             # 受信したモデルをロード
             print(f"--- Process {accelerator.process_index}: Loading broadcasted state_dict ---")
-            model.load_state_dict(object_to_broadcast[0])
+            model.load_state_dict(object_to_broadcast[0], strict=False)
+
+            # broadcastではPython属性(initialized)は同期されないため、全rankで揃える
+            def _finalize_inverse_pissa(module):
+                if isinstance(module, InversePiSSALayer):
+                    module.initialized = True
+                    module.original_weight = None
+            model.apply(_finalize_inverse_pissa)
             
             # メモリを解放
             del object_to_broadcast
