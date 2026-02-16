@@ -519,7 +519,7 @@ def load_and_process_datasets(dataset_names, dataset_config, tokenizer, max_leng
 def train():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_id", type=str, default="Qwen/Qwen2.5-0.5B-Instruct")
-    parser.add_argument("--tokenizer_id", type=str, default="Qwen/Qwen2.5-0.5B-Instruct")
+    parser.add_argument("--tokenizer_id", type=str, default=None, help="If empty, uses the same model as the base model.")
     parser.add_argument("--dataset_names", "--dataset_name", dest="dataset_names", type=str, required=True)
     parser.add_argument("--dataset_config", type=str, default=None)
     parser.add_argument("--output_dir", type=str, default="./output_stable_pissa")
@@ -571,8 +571,9 @@ def train():
         accelerator = Accelerator()
     
     # トークナイザー
-    print(f"Loading tokenizer model: {args.tokenizer_id}")
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_id)
+    tokenizer_id = args.tokenizer_id if args.tokenizer_id is not None else args.model_id
+    print(f"Loading tokenizer model: {tokenizer_id}")
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_id)
     if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
     
     # モデルロード
