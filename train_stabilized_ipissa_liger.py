@@ -224,7 +224,11 @@ class StabilizedLigerWrapper(nn.Module):
         
         # モデル構造の特定
         if hasattr(model, "model") and hasattr(model.model, "layers"):
-            self.layers = model.model.layers
+            if hasattr(model.model.layers, "layers"):
+                # MoE Case
+                self.layers = model.model.layers.layers
+            else:
+                self.layers = model.model.layers
         elif hasattr(model, "base_model") and hasattr(model.base_model.model, "model"): # LoRA Case
             self.layers = model.base_model.model.model.layers
         else: # Generic Fallback
@@ -258,7 +262,7 @@ class StabilizedLigerWrapper(nn.Module):
                 layer.self_attn.o_proj.forward = types.MethodType(new_o_proj_forward, layer.self_attn.o_proj)
 
             # MLP Output (down_proj)
-            if hasattr(layer.mlp, "down_proj"):
+            if hasattr(layer, "mlp") and hasattr(layer.mlp, "down_proj"):
                 original_down_proj_forward = layer.mlp.down_proj.forward
                 key_mlp = f"layer_{i}_mlp"
 
@@ -268,6 +272,34 @@ class StabilizedLigerWrapper(nn.Module):
                     return out * scale
 
                 layer.mlp.down_proj.forward = types.MethodType(new_down_proj_forward, layer.mlp.down_proj)
+                
+            moe_block = getattr(layer, "block_sparse_moe", getattr(layer, "mlp", None))
+            
+            if moe_block is not None and hasattr(moe_block, "experts"):
+                # Expertsのリストをループ処理
+                for expert_idx, expert in enumerate(moe_block.experts):
+                    # Expert内の出力層を探す (Mixtralは 'w2', Qwen/Llamaは 'down_proj')
+                    target_linear = getattr(expert, "down_proj", getattr(expert, "w2", None))
+                    
+                    if target_linear is not None:
+                        # パラメータ管理用のキーを一意にする
+                        key_moe = f"layer_{i}_moe_exp_{expert_idx}"
+                        
+                        # Scaleパラメータが未登録なら登録 (初期化)
+                        if key_moe not in self.scales:
+                            ref_param = next(self.model.parameters())
+                            self.scales[key_moe] = nn.Parameter(
+                                torch.ones(1, device=ref_param.device, dtype=ref_param.dtype) * 0.1 # init_scale
+                            )
+
+                        original_forward = target_linear.forward
+
+                        def new_moe_forward(module_self, x, *args, wrapper_ref=self, param_key=key_moe, orig_f=original_forward, **kwargs):
+                            out = orig_f(x, *args, **kwargs)
+                            scale = wrapper_ref.scales[param_key]
+                            return out * scale
+
+                        target_linear.forward = types.MethodType(new_moe_forward, target_linear)
                 
     def get_input_embeddings(self): return self.model.get_input_embeddings()
     def set_input_embeddings(self, value): self.model.set_input_embeddings(value)
@@ -439,7 +471,10 @@ class StabilizedLigerWrapper(nn.Module):
         
         # 3. LayerScale 適用
         print(" -> Merging LayerScale weights (Stabilization)...")
-        layers = model_merged.model.layers
+        if hasattr(model_merged.model.layers, "layers"):
+            layers = model_merged.model.layers.layers
+        else:
+            layers = model_merged.model.layers
         with torch.no_grad():
             for i, layer in enumerate(layers):
                 if hasattr(layer.self_attn, "o_proj"):
@@ -450,6 +485,20 @@ class StabilizedLigerWrapper(nn.Module):
                     scale = self.scales[f"layer_{i}_mlp"].item()
                     print(f"    Applying LayerScale to layer {i} mlp: {scale}")
                     layer.mlp.down_proj.weight.data *= scale
+                    
+                moe_block = getattr(layer, "block_sparse_moe", getattr(layer, "mlp", None))
+                    
+                if moe_block is not None and hasattr(moe_block, "experts"):
+                    # Expertsのリストをループ処理
+                    for expert_idx, expert in enumerate(moe_block.experts):
+                        # Expert内の出力層を探す (Mixtralは 'w2', Qwen/Llamaは 'down_proj')
+                        target_linear = getattr(expert, "down_proj", getattr(expert, "w2", None))
+                        
+                        if target_linear is not None:
+                            key_moe = f"layer_{i}_moe_exp_{expert_idx}"
+                            scale = self.scales[key_moe].item()
+                            print(f"    Applying LayerScale to layer {i} MoE expert {expert_idx}: {scale}")
+                            target_linear.weight.data *= scale
         
         print(f"Saving fully merged model to {output_dir}...")
         model_merged.save_pretrained(output_dir)
@@ -457,7 +506,7 @@ class StabilizedLigerWrapper(nn.Module):
 
 
 # --- 3. データセット処理 ---
-def process_single_dataset(name, config_name, tokenizer, max_length=512, local_rank=0):
+def process_single_dataset(name, config_name, tokenizer, max_length=512, add_token_str=None):
     print(f"Loading: {name} (config: {config_name})")
     try:
         if name.endswith(".json") or name.endswith(".jsonl") or name.endswith(".csv"):
@@ -478,14 +527,19 @@ def process_single_dataset(name, config_name, tokenizer, max_length=512, local_r
             texts = []
             for q, a in zip(examples['query'], examples['answer']):
                 messages = [{"role": "user", "content": q}, {"role": "assistant", "content": a}]
-                try: text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
-                except: text = f"user: {q}\nassistant: {a}\n</s>"
+                try:
+                    text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+                except:
+                    text = f"user: {q}\nassistant: {a}\n</s>"
+                if add_token_str is not None:
+                    text = add_token_str + text
                 texts.append(text)
             return tokenizer(texts, padding="max_length", truncation=True, max_length=max_length)
         ds = ds.map(tokenize_chat, batched=True, remove_columns=cols)
     elif "text" in cols:
         def tokenize_text(examples):
-            texts = [t + tokenizer.eos_token for t in examples['text']]
+            add_str = "" if add_token_str is None else add_token_str
+            texts = [add_str + t + tokenizer.eos_token for t in examples['text']]
             return tokenizer(texts, padding="max_length", truncation=True, max_length=max_length)
         ds = ds.map(tokenize_text, batched=True, remove_columns=cols)
     else:
@@ -496,19 +550,26 @@ def process_single_dataset(name, config_name, tokenizer, max_length=512, local_r
         return examples
     return ds.map(add_labels, batched=True)
 
-def load_and_process_datasets(dataset_names, dataset_config, tokenizer, max_length=512, local_rank=0, procecced_callback=None):
+def load_and_process_datasets(dataset_names, dataset_config, tokenizer, max_length=512, add_first_tokens=None, local_rank=0, procecced_callback=None):
     all_processed_datasets = []
     name_list = dataset_names.split(",")
+    if dataset_config is not None:
+        dataset_config = dataset_config.split(",")
+    elif len(name_list) > 1:
+        dataset_config = [None] * len(name_list)
+    if add_first_tokens is not None:
+        add_token_str = add_first_tokens.split(",")
+    else:
+        add_token_str = [None] * len(name_list)
+        
     if local_rank == 0:
-        if dataset_config is not None:
-            dataset_config = dataset_config.split(",")
-        elif len(name_list) > 1:
-            dataset_config = [None] * len(name_list)
-        for name, config in zip(name_list, dataset_config):
+        # トークナイズや結合を先に行っておくため、
+        # local_rankが0のプロセスのみに処理させる
+        for name, config, add_token in zip(name_list, dataset_config, add_token_str):
             name = name.strip()
             if not name:
                 continue
-            processed = process_single_dataset(name, config, tokenizer, max_length)
+            processed = process_single_dataset(name, config, tokenizer, max_length, add_token)
             if processed is not None:
                 all_processed_datasets.append(processed)
         if not all_processed_datasets:
@@ -518,15 +579,12 @@ def load_and_process_datasets(dataset_names, dataset_config, tokenizer, max_leng
         # 同期用
         procecced_callback()
     
-    if dataset_config is not None:
-        dataset_config = dataset_config.split(",")
-    elif len(name_list) > 1:
-        dataset_config = [None] * len(name_list)
-    for name, config in zip(name_list, dataset_config):
+    # データセットを全プロセスでロード
+    for name, config, add_token in zip(name_list, dataset_config, add_token_str):
         name = name.strip()
         if not name:
             continue
-        processed = process_single_dataset(name, config, tokenizer, max_length)
+        processed = process_single_dataset(name, config, tokenizer, max_length, add_token)
         if processed is not None:
             all_processed_datasets.append(processed)
     if not all_processed_datasets:
@@ -545,6 +603,8 @@ def train():
     parser.add_argument("--dataset_config", type=str, default=None)
     parser.add_argument("--output_dir", type=str, default="./output_stable_pissa")
     
+    parser.add_argument("--add_first_tokens", type=str, default=None, help="Comma separated list of additional tokens to add to the beginning of the input sequence.")
+    
     # Mode flags
     parser.add_argument("--only_train_layerscale", action="store_true")
     parser.add_argument("--use_lora", action="store_true")
@@ -554,6 +614,9 @@ def train():
     parser.add_argument("--svd_device", type=str, default="cpu", help="SVD device")
     
     parser.add_argument("--optim_setup", type=str, default="schedule_free_radam", help="optimizer setup")
+    
+    parser.add_argument("--attn_implementation", type=str, default="flash_attention_2", help="Attention implementation")
+    parser.add_argument("--use_liger_kernel", action="store_true", help="Use LigerKernelForCausalLM instead of AutoModelForCausalLM")
     
     # Tuning Hyperparams
     parser.add_argument("--lora_r", type=int, default=16)
@@ -600,6 +663,19 @@ def train():
     )
     if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
     
+    add_first_tokens = None
+    num_added_tokens = 0
+    if args.add_first_tokens is not None:
+        # prefixトークンの追加処理
+        add_first_tokens = args.add_first_tokens.split(",")
+        for token in add_first_tokens:
+            if len(token) > 0 and len(tokenizer.tokenize(token)) > 1:
+                # 新規トークンとして追加
+                tokenizer.add_tokens([token])
+                num_added_tokens += 1
+    if num_added_tokens > 0:
+        print(f"Added {num_added_tokens} tokens to the tokenizer.")
+    
     # モデルロード
     # accelerateが設定するLOCAL_RANKから、このプロセスが使用すべきデバイスを取得
     # ローカルランクが設定されていない場合(シングルGPU実行)はcuda:0をフォールバックとして使用
@@ -614,14 +690,19 @@ def train():
         main_process_ctx = nullcontext()
 
     with main_process_ctx:
-        model = AutoLigerKernelForCausalLM.from_pretrained(
+        autoModelClass = AutoLigerKernelForCausalLM if args.use_liger_kernel else AutoModelForCausalLM
+        model = autoModelClass.from_pretrained(
             args.model_id,
             torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
-            attn_implementation="flash_attention_2",
+            attn_implementation=args.attn_implementation,
             trust_remote_code=True,
             # device_map = "auto"
         )
         model_dtype = model.dtype
+        
+        if num_added_tokens > 0:
+            # embed_tokensのりサイズ
+            model.resize_token_embeddings(len(tokenizer))
 
     # --- 構造変更の適用 ---
     
@@ -733,7 +814,7 @@ def train():
         print(f"Trainable params: {trainable_params:,} / {all_params:,} ({100*trainable_params/all_params:.2f}%)")
 
     # データセットロード
-    train_dataset = load_and_process_datasets(args.dataset_names, args.dataset_config, tokenizer, args.max_length, local_rank, None if not args.use_ddp else accelerator.wait_for_everyone)
+    train_dataset = load_and_process_datasets(args.dataset_names, args.dataset_config, tokenizer, args.max_length, args.add_first_tokens, local_rank, None if not args.use_ddp else accelerator.wait_for_everyone)
     # Shuffle
     train_dataset = train_dataset.shuffle(seed=args.dataset_seed)
     
