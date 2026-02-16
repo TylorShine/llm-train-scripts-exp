@@ -597,6 +597,7 @@ def train():
             trust_remote_code=True,
             # device_map = "auto"
         )
+        model_dtype = model.dtype
 
     # --- 構造変更の適用 ---
     
@@ -669,6 +670,10 @@ def train():
         )
         model = get_peft_model(model, peft_config)
         model.print_trainable_parameters()
+        
+    # 念の為モデルの型を変更
+    model = model.to(dtype=model_dtype)
+    print(f"Model dtype: {model.dtype}")
 
     # 3. 安定化ラッパーの適用 (LayerScale & Losses)
     #    PiSSA層に対しても forward hook をかけることで LayerScale は機能する
@@ -704,9 +709,11 @@ def train():
         print(f"Trainable params: {trainable_params:,} / {all_params:,} ({100*trainable_params/all_params:.2f}%)")
 
     # データセットロード
-    train_dataset = load_and_process_datasets(args.dataset_names, args.dataset_config, tokenizer, args.max_length)
-    # Shuffle
-    train_dataset = train_dataset.shuffle(seed=args.dataset_seed)
+    if int(local_rank) == 0:
+        # rank0のみが実行
+        train_dataset = load_and_process_datasets(args.dataset_names, args.dataset_config, tokenizer, args.max_length)
+        # Shuffle
+        train_dataset = train_dataset.shuffle(seed=args.dataset_seed)
     
     # Logging
     reporters = []
