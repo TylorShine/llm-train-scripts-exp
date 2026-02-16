@@ -444,9 +444,11 @@ class StabilizedLigerWrapper(nn.Module):
             for i, layer in enumerate(layers):
                 if hasattr(layer.self_attn, "o_proj"):
                     scale = self.scales[f"layer_{i}_attn"].item()
+                    print(f"    Applying LayerScale to layer {i} attn: {scale}")
                     layer.self_attn.o_proj.weight.data *= scale
                 if hasattr(layer.mlp, "down_proj"):
                     scale = self.scales[f"layer_{i}_mlp"].item()
+                    print(f"    Applying LayerScale to layer {i} mlp: {scale}")
                     layer.mlp.down_proj.weight.data *= scale
         
         print(f"Saving fully merged model to {output_dir}...")
@@ -517,6 +519,7 @@ def load_and_process_datasets(dataset_names, dataset_config, tokenizer, max_leng
 def train():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_id", type=str, default="Qwen/Qwen2.5-0.5B-Instruct")
+    parser.add_argument("--tokenizer_id", type=str, default="Qwen/Qwen2.5-0.5B-Instruct")
     parser.add_argument("--dataset_names", "--dataset_name", dest="dataset_names", type=str, required=True)
     parser.add_argument("--dataset_config", type=str, default=None)
     parser.add_argument("--output_dir", type=str, default="./output_stable_pissa")
@@ -568,8 +571,8 @@ def train():
         accelerator = Accelerator()
     
     # トークナイザー
-    print(f"Loading model: {args.model_id}")
-    tokenizer = AutoTokenizer.from_pretrained(args.model_id)
+    print(f"Loading tokenizer model: {args.tokenizer_id}")
+    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_id)
     if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
     
     # モデルロード
