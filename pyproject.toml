@@ -9,7 +9,8 @@ dependencies = [
     # --- Core ML/DL Frameworks ---
     "torch>=2.1",
     # --- Hugging Face Ecosystem ---
-    "transformers>=4.38",
+    "transformers[chat,serving]>=4.38,<5",
+    "rich",
     "datasets>=2.18",
     "peft>=0.9",
     "accelerate>=0.27",
